@@ -1,0 +1,202 @@
+// ============================================================
+//  PC (USB serial) -> GSM (SIM800L/A7670) SOS SMS + CALL
+//                  -> ESP-NOW -> Relay Node (fan/light)
+//
+//  LED FEEDBACK (onboard LED, GPIO2):
+//   - 3 blinks on boot  = firmware running, HUB ready
+//   - quick flash       = any serial byte received from PC
+//   - longer flash      = valid command received
+//   - fast double-flash = relay command sent via ESP-NOW
+//   - fast triple-flash = SOS triggered
+//
+//  WIRING:
+//   SIM800L VCC  -> 3.7-4.2V (Li-Ion / buck @4.0V, 2A!) NOT 5V
+//   SIM800L GND  -> ESP32 GND (common!)
+//   SIM800L TX   -> ESP32 GPIO16 (RX2)
+//   SIM800L RX   -> ESP32 GPIO17 (TX2)
+// ============================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ---------------- USER SETTINGS ----------------
+#define LED_PIN      2         // onboard LED (most ESP32 dev boards)
+#define GSM_RX_PIN   16        // ESP32 RX2  <- GSM TX
+#define GSM_TX_PIN   17        // ESP32 TX2  -> GSM RX
+#define GSM_BAUD     9600      // SIM800L: 9600 | A7670/SIM7600: 115200
+
+const char* SOS_NUMBER    = "+919778262372";   // <--- EDIT
+const char* FAMILY_NUMBER = "+917012115005";   // <--- EDIT
+const char* SOS_TEXT =
+  "EMERGENCY SOS! The user needs immediate help. "
+  "(hands-free system)";
+
+// Relay node MAC. The relay node prints its MAC on boot.
+// Leave as broadcast (FF:..) to reach it without configuring:
+//uint8_t RELAY_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+uint8_t RELAY_MAC[6] = {0xB0,0xCB,0xD8,0xC9,0xF6,0x74};   // relay node MAC
+#define CALL_RING_SECONDS 25     // auto hang-up after this
+// ------------------------------------------------
+
+typedef struct { uint16_t magic; char cmd[12]; uint32_t seq; } ctl_msg_t;
+#define CTL_MAGIC 0xA11A
+
+HardwareSerial gsm(2);
+uint32_t seqCounter = 0;
+String lineBuf = "";
+
+// ---------------- LED (non-blocking) ----------------
+uint32_t ledOffAt = 0;
+
+void ledPulse(uint32_t ms) {
+  digitalWrite(LED_PIN, HIGH);
+  ledOffAt = millis() + ms;
+}
+
+void ledBlinkTimes(uint8_t n, uint32_t onMs, uint32_t offMs) {
+  for (uint8_t i = 0; i < n; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(onMs);
+    digitalWrite(LED_PIN, LOW);  delay(offMs);
+  }
+}
+
+// ---------------- ESP-NOW ----------------
+// ESP32 core 3.x changed the callback signature — support both.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t st) {
+#else
+void onSent(const uint8_t *mac, esp_now_send_status_t st) {
+#endif
+  Serial.println(st == ESP_NOW_SEND_SUCCESS ? "OK:NOW_ACK" : "ERR:NOW_NOACK");
+}
+
+void sendToRelay(const char* cmd) {
+  ctl_msg_t m;
+  m.magic = CTL_MAGIC;
+  strncpy(m.cmd, cmd, 11); m.cmd[11] = 0;
+  m.seq = ++seqCounter;
+  for (int i = 0; i < 3; i++) {          // retry for reliability
+    esp_now_send(RELAY_MAC, (uint8_t*)&m, sizeof(m));
+    delay(25);
+  }
+  ledPulse(60); ledBlinkTimes(1, 60, 0); // double-flash = relay msg sent
+  Serial.println("OK:RELAY:" + String(cmd));
+}
+
+// ---------------- GSM ----------------
+String gsmWait(const String &expect, uint32_t timeout) {
+  String resp = ""; uint32_t t0 = millis();
+  while (millis() - t0 < timeout) {
+    while (gsm.available()) {
+      resp += (char)gsm.read();
+      if (resp.indexOf(expect) != -1) return resp;
+    }
+  }
+  return resp;
+}
+
+String gsmAT(const String &cmd, uint32_t timeout, const String &expect) {
+  while (gsm.available()) gsm.read();    // flush
+  gsm.println(cmd);
+  return gsmWait(expect, timeout);
+}
+
+bool gsmInit() {
+  Serial.println("EVT:GSM_INIT");
+  gsmAT("AT", 1500, "OK");
+  gsmAT("ATE0", 1000, "OK");
+  gsmAT("AT+CMGF=1", 1500, "OK");
+  String pin = gsmAT("AT+CPIN?", 2500, "READY");
+  String reg = gsmAT("AT+CREG?", 5000, "OK");
+  bool ok = (pin.indexOf("READY") != -1) &&
+            (reg.indexOf(",1") != -1 || reg.indexOf(",5") != -1);
+  Serial.println(ok ? "OK:GSM_READY" : "ERR:GSM_NOT_READY");
+  return ok;
+}
+
+bool gsmSendSMS(const char* number, const char* text) {
+  gsmAT("AT+CMGF=1", 1500, "OK");
+  while (gsm.available()) gsm.read();
+  gsm.print("AT+CMGS=\""); gsm.print(number); gsm.println("\"");
+  if (gsmWait(">", 6000).indexOf(">") == -1) {
+    Serial.println("ERR:SMS_PROMPT"); return false;
+  }
+  gsm.print(text);
+  gsm.write(26);                          // CTRL+Z
+  String r = gsmWait("OK", 15000);
+  bool ok = (r.indexOf("+CMGS") != -1);
+  Serial.println(ok ? "OK:SMS_SENT" : "ERR:SMS_FAIL");
+  return ok;
+}
+
+void gsmCall(const char* number) {
+  gsmAT(String("ATD") + number + ";", 4000, "OK");
+  Serial.println("OK:CALLING");
+  delay(CALL_RING_SECONDS * 1000UL);      // let it ring
+  gsmAT("AT+CHUP", 2500, "OK");           // hang up
+  Serial.println("OK:CALL_ENDED");
+}
+
+void doSOS() {
+  Serial.println("EVT:SOS_START");
+  ledBlinkTimes(3, 80, 80);               // fast triple-flash = SOS
+  bool s1 = gsmSendSMS(SOS_NUMBER, SOS_TEXT);
+  bool s2 = gsmSendSMS(FAMILY_NUMBER, SOS_TEXT);
+  Serial.println((s1 || s2) ? "OK:SOS_SMS" : "ERR:SOS_SMS");
+  gsmCall(SOS_NUMBER);
+  Serial.println("OK:SOS_DONE");
+}
+
+// ---------------- SERIAL PROTOCOL ----------------
+void handleLine(String l) {
+  l.trim(); l.toUpperCase();
+  ledPulse(250);                          // long flash = valid command
+  Serial.println("EVT:CMD:" + l);
+  if      (l == "PING")     Serial.println("OK:PONG");
+  else if (l == "SOS")      doSOS();
+  else if (l == "CALL")     gsmCall(FAMILY_NUMBER);
+  else if (l == "FAN_ON")   sendToRelay("FAN_ON");
+  else if (l == "FAN_OFF")  sendToRelay("FAN_OFF");
+  else if (l == "LIGHT_ON") sendToRelay("LIGHT_ON");
+  else if (l == "LIGHT_OFF")sendToRelay("LIGHT_OFF");
+  else if (l == "ALL_OFF")  sendToRelay("ALL_OFF");
+  else                      Serial.println("ERR:UNKNOWN_CMD");
+}
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) Serial.println("ERR:NOW_INIT");
+  esp_now_register_send_cb(onSent);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, RELAY_MAC, 6);
+  peer.channel = 0; peer.encrypt = false; peer.ifidx = WIFI_IF_STA;
+  esp_now_add_peer(&peer);
+
+  gsm.begin(GSM_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  delay(4000);                 // let GSM module boot
+  gsmInit();
+
+  ledBlinkTimes(3, 150, 150);  // boot pattern = "I am alive & ready"
+  Serial.println("OK:HUB_READY");
+}
+
+void loop() {
+  // LED auto-off (non-blocking)
+  if (ledOffAt && millis() > ledOffAt) {
+    digitalWrite(LED_PIN, LOW);
+    ledOffAt = 0;
+  }
+
+  while (Serial.available()) {
+    ledPulse(40);                        // flash on ANY byte from PC
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (lineBuf.length()) { handleLine(lineBuf); lineBuf = ""; }
+    } else lineBuf += c;
+    if (lineBuf.length() > 32) lineBuf = "";
+  }
+}
