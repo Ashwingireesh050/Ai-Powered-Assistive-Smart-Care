@@ -1,0 +1,94 @@
+// ============================================================
+//  ESP-NOW receiver -> 2-channel relay (FAN / LIGHT)
+//
+//  WIRING:
+//   Relay VCC -> 5V · GND -> GND (common with ESP32)
+//   Relay IN1 -> GPIO26 (FAN) · IN2 -> GPIO27 (LIGHT)
+//   Most relay boards are ACTIVE-LOW (kept as a #define)
+//   Serial Monitor test: press 'f' = fan, 'l' = light
+// ============================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define RELAY_FAN    26
+#define RELAY_LIGHT  27
+#define RELAY_ACTIVE_LOW 1     // set 0 if your board is active-HIGH
+#define STATUS_LED   2
+
+typedef struct { uint16_t magic; char cmd[12]; uint32_t seq; } ctl_msg_t;
+#define CTL_MAGIC 0xA11A
+
+bool fanOn = false, lightOn = false;
+uint32_t lastSeq = 0, ledOffAt = 0;
+
+void setPin(uint8_t pin, bool on) {
+#if RELAY_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+void applyRelays() {
+  setPin(RELAY_FAN, fanOn);
+  setPin(RELAY_LIGHT, lightOn);
+}
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+#else
+void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
+#endif
+  if (len != sizeof(ctl_msg_t)) return;
+  ctl_msg_t m; memcpy(&m, data, sizeof(m));
+  if (m.magic != CTL_MAGIC || m.seq == lastSeq) return;   // dedup retries
+  lastSeq = m.seq;
+
+  String cmd = String(m.cmd);
+  if      (cmd == "FAN_ON")    { fanOn = true;    Serial.println("FAN -> ON"); }
+  else if (cmd == "FAN_OFF")   { fanOn = false;   Serial.println("FAN -> OFF"); }
+  else if (cmd == "LIGHT_ON")  { lightOn = true;  Serial.println("LIGHT -> ON"); }
+  else if (cmd == "LIGHT_OFF") { lightOn = false; Serial.println("LIGHT -> OFF"); }
+  else if (cmd == "ALL_OFF")   { fanOn = lightOn = false; Serial.println("ALL -> OFF"); }
+  else return;
+
+  applyRelays();
+  digitalWrite(STATUS_LED, HIGH);
+  ledOffAt = millis() + 120;
+}
+
+#include "esp_wifi.h"   // add at top, under the other #includes
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_FAN, OUTPUT);   setPin(RELAY_FAN, false);
+  pinMode(RELAY_LIGHT, OUTPUT); setPin(RELAY_LIGHT, false);
+  pinMode(STATUS_LED, OUTPUT);
+
+  WiFi.mode(WIFI_STA);
+  delay(500);                    // <-- let WiFi driver fully start
+
+  if (esp_now_init() != ESP_OK) { Serial.println("ERR:NOW_INIT"); }
+  esp_now_register_recv_cb(onRecv);
+
+  Serial.println();
+  Serial.println("=== RELAY NODE READY ===");
+
+  uint8_t mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+  Serial.printf("MY MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void loop() {
+  if (ledOffAt && millis() > ledOffAt) {
+    digitalWrite(STATUS_LED, LOW); ledOffAt = 0;
+  }
+  // manual test from Serial Monitor
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'f') { fanOn = !fanOn;   applyRelays(); Serial.println(fanOn ? "FAN ON" : "FAN OFF"); }
+    if (c == 'l') { lightOn = !lightOn; applyRelays(); Serial.println(lightOn ? "LIGHT ON" : "LIGHT OFF"); }
+  }
+}
